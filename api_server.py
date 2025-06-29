@@ -1,9 +1,8 @@
 # api_server.py
-# A simple web server to bridge the Roblox game and the Discord bot's database.
-# Now includes endpoints for managing spectate duel trace requests.
+# A simple web server to bridge the Discord bot and the Roblox client.
+# Now ONLY includes endpoints for managing spectate duel trace requests and a simple 'trigger'.
 
 from flask import Flask, jsonify, request
-import sqlite3
 import logging
 import threading
 import os 
@@ -13,19 +12,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- CONFIGURATION ---
-# For Render, database file usually needs to be in a persistent volume or use an external DB.
-# For simplicity in this example, we'll use an in-memory SQLite for active_trace_request,
-# and a file-based SQLite for robux_donations.db which might be transient on Render's free tier.
-# For production, consider Render Disk or a dedicated database service (e.g., PostgreSQL).
-DATABASE_FILE = 'robux_donations.db' # Existing database for robux donations
-
-# IMPORTANT: These keys MUST match what's set in your .env file and Roblox script/Discord bot.
-# On Render, these env vars will be directly set in the Render dashboard.
-API_KEY = os.getenv('API_KEY', 'DEFAULT_ROBLOX_API_KEY') 
+# IMPORTANT: This key MUST match what's set in your .env file and Discord bot.
+# On Render, this env var will be directly set in the Render dashboard.
 DISCORD_BOT_API_KEY = os.getenv('DISCORD_BOT_API_KEY', 'DEFAULT_DISCORD_BOT_API_KEY') 
 
 # For Render, Flask typically listens on 0.0.0.0 and a port provided by the environment.
-# We'll use os.getenv("PORT") which Render automatically provides.
 HOST = '0.0.0.0'
 PORT = int(os.getenv('PORT', 3000)) # Render provides the PORT env var
 
@@ -39,140 +30,38 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 active_trace_request = None 
 trace_lock = threading.Lock() # To safely update the active_trace_request from multiple threads
 
-def get_db_connection():
-    """Establishes a connection to the SQLite database."""
-    # The check_same_thread=False is important for Flask to handle threads correctly.
-    # On Render, this might mean a new connection for each request if not using a connection pool.
-    conn = sqlite3.connect(DATABASE_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# --- Global state for the 'trigger' command (in-memory, will reset on server restart) ---
+# This simple boolean flag will tell the Roblox client to perform a test action.
+is_trigger_pending = False
+trigger_lock = threading.Lock() # To safely update the trigger state
 
 # --- SECURITY HELPER ---
-def verify_api_key(provided_key, expected_key):
-    """Verifies if the provided API key matches the expected key."""
+def verify_discord_bot_api_key(provided_key, expected_key):
+    """Verifies if the provided API key from Discord bot matches the expected key."""
     if provided_key != expected_key:
-        logging.warning(f"Unauthorized API access attempt from IP: {request.remote_addr} with key: '{provided_key}' (expected: '{expected_key}')")
+        logging.warning(f"Unauthorized Discord bot API access attempt from IP: {request.remote_addr} with key: '{provided_key}' (expected: '{expected_key}')")
         return False
     return True
 
-# --- API ENDPOINTS (Existing) ---
-
-@app.route('/get_balance', methods=['GET'])
-def get_balance():
-    """
-    Handles GET requests from the Roblox game to get a player's balance.
-    Expects 'roblox_id' and 'api_key' as query parameters.
-    """
-    provided_key = request.args.get('api_key')
-    if not verify_api_key(provided_key, API_KEY):
-        return jsonify({"error": "Invalid API Key"}), 401
-
-    roblox_id_str = request.args.get('roblox_id')
-    if not roblox_id_str:
-        return jsonify({"error": "roblox_id parameter is missing"}), 400
-    try:
-        roblox_id = int(roblox_id_str)
-    except ValueError:
-        return jsonify({"error": "roblox_id parameter must be an integer"}), 400
-
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT balance FROM users WHERE linked_roblox_id = ?", (roblox_id,))
-        user_data = cursor.fetchone()
-        conn.close()
-
-        if user_data:
-            balance = user_data['balance']
-            logging.info(f"GET /get_balance: Successfully retrieved balance for Roblox ID {roblox_id}: {balance}")
-            return jsonify({"success": True, "balance": balance})
-        else:
-            logging.info(f"GET /get_balance: No data found for Roblox ID {roblox_id}. Returning default balance of 0.")
-            return jsonify({"success": True, "balance": 0})
-
-    except Exception as e:
-        logging.error(f"GET /get_balance: Error for Roblox ID {roblox_id}: {e}")
-        return jsonify({"error": "An internal server error occurred"}), 500
-
-
-@app.route('/update_balance', methods=['POST'])
-def update_balance():
-    """
-    Handles POST requests from the Roblox game to add to a player's balance after a purchase.
-    Expects a JSON body with 'roblox_id', 'amount_to_add', and 'api_key'.
-    """
-    if not request.is_json:
-        return jsonify({"error": "Request must be JSON"}), 400
-        
-    data = request.get_json()
-    provided_key = data.get('api_key')
-    if not verify_api_key(provided_key, API_KEY):
-        return jsonify({"error": "Invalid API Key"}), 401
-
-    roblox_id_str = data.get('roblox_id')
-    amount_to_add_str = data.get('amount_to_add')
-
-    if not roblox_id_str or not amount_to_add_str:
-        return jsonify({"error": "roblox_id and amount_to_add are required"}), 400
-
-    try:
-        roblox_id = int(roblox_id_str)
-        amount_to_add = int(amount_to_add_str)
-    except ValueError:
-        return jsonify({"error": "roblox_id and amount_to_add must be integers"}), 400
-
-    if amount_to_add <= 0:
-        return jsonify({"error": "amount_to_add must be a positive value"}), 400
-
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("BEGIN TRANSACTION;")
-        cursor.execute("SELECT balance FROM users WHERE linked_roblox_id = ?", (roblox_id,))
-        user_exists = cursor.fetchone()
-
-        if user_exists:
-            cursor.execute(
-                "UPDATE users SET balance = balance + ? WHERE linked_roblox_id = ?",
-                (amount_to_add, roblox_id)
-            )
-            logging.info(f"POST /update_balance: Updated balance for Roblox ID {roblox_id}. Added {amount_to_add}.")
-        else:
-            logging.warning(f"POST /update_balance: Attempted to update balance for non-existent user with Roblox ID {roblox_id}.")
-
-        conn.commit()
-        return jsonify({"success": True, "message": "Balance update processed."})
-
-    except Exception as e:
-        logging.error(f"POST /update_balance: Error for Roblox ID {roblox_id}: {e}")
-        if conn:
-            conn.rollback()
-        return jsonify({"error": "An internal server error occurred"}), 500
-    finally:
-        if conn:
-            conn.close()
-
-# --- API ENDPOINTS (New for Duel Tracing) ---
+# --- API ENDPOINTS (Duel Tracing) ---
 
 @app.route('/request_trace', methods=['POST'])
 def request_trace():
     """
     Handles POST requests from the Discord bot to request a duel trace.
-    Expects a JSON body with 'player1Id', 'player2Id', and 'api_key'.
-    Optionally, 'requester_discord_id' can be included for tracking.
+    Requires DISCORD_BOT_API_KEY.
     """
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
     
     data = request.get_json()
     provided_key = data.get('api_key')
-    if not verify_api_key(provided_key, DISCORD_BOT_API_KEY):
+    if not verify_discord_bot_api_key(provided_key, DISCORD_BOT_API_KEY):
         return jsonify({"error": "Invalid API Key"}), 401
 
     player1_id = data.get('player1Id', type=int)
     player2_id = data.get('player2Id', type=int)
-    requester_discord_id = data.get('requester_discord_id', type=str) # Optional
+    requester_discord_id = data.get('requester_discord_id', type=str)
 
     if not player1_id or not player2_id:
         return jsonify({"error": "player1Id and player2Id are required"}), 400
@@ -204,7 +93,7 @@ def request_trace():
 def get_trace_target():
     """
     Handles GET requests from the Roblox script to get the current trace target.
-    Expects 'client_id' and 'client_name' as query parameters.
+    Includes the 'trigger' status.
     """
     client_id = request.args.get('client_id', type=int)
     client_name = request.args.get('client_name', type=str)
@@ -212,24 +101,34 @@ def get_trace_target():
     if not client_id or not client_name:
         return jsonify({"error": "client_id and client_name are required"}), 400
 
+    current_trace = None
     with trace_lock:
-        if active_trace_request:
-            logging.info(f"Roblox client {client_name} ({client_id}) requested trace target. Providing: {active_trace_request['player1Id']}, {active_trace_request['player2Id']}.")
-            return jsonify({
-                "status": "tracing",
-                "targetPlayer1Id": active_trace_request["player1Id"],
-                "targetPlayer2Id": active_trace_request["player2Id"],
-                "requester_discord_id": active_trace_request["requester_discord_id"]
-            })
-        else:
-            logging.info(f"Roblox client {client_name} ({client_id}) requested trace target. No active trace.")
-            return jsonify({"status": "idle"})
+        current_trace = active_trace_request
+
+    current_trigger_status = False
+    with trigger_lock:
+        current_trigger_status = is_trigger_pending
+
+    response_data = {
+        "status": "idle", # Default to idle for trace status
+        "triggerPending": current_trigger_status
+    }
+
+    if current_trace:
+        response_data["status"] = "tracing"
+        response_data["targetPlayer1Id"] = current_trace["player1Id"]
+        response_data["targetPlayer2Id"] = current_trace["player2Id"]
+        response_data["requester_discord_id"] = current_trace["requester_discord_id"]
+        logging.info(f"Roblox client {client_name} ({client_id}) requested trace target. Providing: {current_trace['player1Id']}, {current_trace['player2Id']}.")
+    else:
+        logging.info(f"Roblox client {client_name} ({client_id}) requested trace target. No active trace.")
+    
+    return jsonify(response_data)
 
 @app.route('/trace_complete', methods=['POST'])
 def trace_complete():
     """
     Handles POST requests from the Roblox script to signal that a trace is complete.
-    Expects a JSON body with 'clientId', 'status', and 'duelId'.
     'status' can be 'completed' or 'aborted'.
     """
     if not request.is_json:
@@ -237,9 +136,9 @@ def trace_complete():
     
     data = request.get_json()
     client_id = data.get('clientId', type=int)
-    status = data.get('status', type=str) # 'completed', 'aborted'
+    status = data.get('status', type=str) 
     duel_id = data.get('duelId', type=str)
-    reason = data.get('reason', type=str) # Optional reason for 'aborted' status
+    reason = data.get('reason', type=str)
 
     if not client_id or not status:
         return jsonify({"error": "clientId and status are required"}), 400
@@ -254,40 +153,63 @@ def trace_complete():
             logging.warning(f"Roblox client {client_id} reported trace {status} for duel {duel_id}, but no active trace was found.")
             return jsonify({"success": False, "message": "No active trace to complete."}), 404 # Not Found
 
+# --- API ENDPOINTS (Trigger) ---
+
+@app.route('/set_trigger', methods=['POST'])
+def set_trigger():
+    """
+    Handles POST requests from the Discord bot to set the 'trigger' flag.
+    Requires DISCORD_BOT_API_KEY.
+    """
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+    
+    data = request.get_json()
+    provided_key = data.get('api_key')
+    if not verify_discord_bot_api_key(provided_key, DISCORD_BOT_API_KEY):
+        return jsonify({"error": "Invalid API Key"}), 401
+
+    with trigger_lock:
+        global is_trigger_pending
+        is_trigger_pending = True
+    
+    logging.info("Received 'set_trigger' request. Trigger is now pending.")
+    return jsonify({"success": True, "message": "Trigger set successfully."})
+
+@app.route('/clear_trigger', methods=['POST'])
+def clear_trigger():
+    """
+    Handles POST requests from the Roblox script to clear the 'trigger' flag after action.
+    """
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+    
+    data = request.get_json()
+    client_id = data.get('clientId', type=int)
+    client_name = data.get('clientName', type=str)
+
+    if not client_id or not client_name:
+        return jsonify({"error": "clientId and clientName are required"}), 400
+
+    with trigger_lock:
+        global is_trigger_pending
+        if is_trigger_pending:
+            is_trigger_pending = False
+            logging.info(f"Roblox client {client_name} ({client_id}) reported trigger cleared. Trigger is now reset.")
+            return jsonify({"success": True, "message": "Trigger cleared successfully."})
+        else:
+            logging.warning(f"Roblox client {client_id} reported trigger cleared, but no trigger was pending.")
+            return jsonify({"success": False, "message": "No trigger was pending to clear."}), 404
+
+
 if __name__ == '__main__':
-    # Ensure the database is set up when the server starts
-    # Note: On Render free tier, this SQLite file might reset with each deployment or restart.
-    # For persistent data, consider Render's Persistent Disks or an external database like PostgreSQL.
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            discord_id INTEGER PRIMARY KEY,
-            discord_username TEXT NOT NULL,
-            phrase TEXT,
-            linked_roblox_id INTEGER,
-            linked_roblox_username TEXT,
-            balance INTEGER DEFAULT 0,
-            session_expiry_timestamp REAL
-        )
-    ''')
-    try:
-        cursor.execute('ALTER TABLE users ADD COLUMN session_expiry_timestamp REAL;')
-    except sqlite3.OperationalError:
-        pass # Column already exists
-    conn.commit()
-    conn.close()
-    logging.info("Database setup complete.")
-
-
-    print("--- Roblox-Discord DB Bridge API (v2) with Duel Tracing ---")
+    print("--- Duel Tracing and Trigger API Server ---")
     print(f"Starting server on {HOST}:{PORT}")
     print("Endpoints available:")
-    print("  /get_balance (GET) - For Roblox leaderstats")
-    print("  /update_balance (POST) - For Roblox leaderstats")
     print("  /request_trace (POST) - For Discord bot to request a duel trace")
-    print("  /get_trace_target (GET) - For Roblox client to poll for trace targets")
+    print("  /get_trace_target (GET) - For Roblox client to poll for trace targets (includes trigger status)")
     print("  /trace_complete (POST) - For Roblox client to report trace completion")
-    print("IMPORTANT: Make sure your API_KEY and DISCORD_BOT_API_KEY are set in your .env file and are secret.")
-    # For Render, use the PORT environment variable provided by Render.
+    print("  /set_trigger (POST) - For Discord bot to set a 'trigger' for Roblox client")
+    print("  /clear_trigger (POST) - For Roblox client to clear the 'trigger'")
+    print("IMPORTANT: Make sure your DISCORD_BOT_API_KEY is set in your .env file and is secret.")
     app.run(host=HOST, port=PORT)
